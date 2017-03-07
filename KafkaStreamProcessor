@@ -1,0 +1,37 @@
+
+@serializable class KafkaStreamProcesser(toDF: (scala.Any) => DataFrame, processDF: scala.Any => DataFrame) extends Executor {
+  override var convertSourceToDataFrame = toDF
+  override var processDataFrame = processDF
+
+  def createContext(): StreamingContext = {
+    val streamingContext = new StreamingContext(SparkContext.getOrCreate(), Seconds(100))
+    streamingContext.checkpoint("PathToCheckPoint")
+
+    val directKafkaStream = KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder](streamingContext,
+      Map("bootstrap.servers" -> "BrokerList",
+        "group.id" -> "GroupName",
+        "auto.offset.reset" -> "smallest"),
+      Set("TopicName"))
+
+    directKafkaStream.checkpoint(Seconds(1000))
+    directKafkaStream.foreachRDD(processStream _)
+    streamingContext
+  }
+
+  def processStream(rdd: RDD[(String, String)]): Unit = {
+    val valuesRDD = rdd.map(tuple => tuple._2).filter(x => x != null)
+    try {
+      process(valuesRDD)
+    } catch {
+      case e: Exception => {
+        LOG.error("Stream Failed" + e.getMessage(), e)
+      }
+    }
+  }
+
+  override def run() {
+    val streamingContext = StreamingContext.getOrCreate(config(Constants.KAFKA_STREAM.CHECK_POINT).asInstanceOf[String], createContext _)
+    streamingContext.start()
+    streamingContext.awaitTermination()
+  }
+}
