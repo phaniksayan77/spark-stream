@@ -1,0 +1,133 @@
+import org.apache.spark.ml._
+import org.apache.spark.ml.classification.LogisticRegression
+import org.apache.spark.ml.feature._
+import org.apache.spark.mllib.linalg.Vector
+import org.apache.spark.sql.Row
+
+val training = sqlContext.createDataFrame(Seq((0L, "a b c d e spark", 1.0),(1L, "b d", 0.0),(2L, "spark f g h", 1.0),(3L, "hadoop mapreduce", 0.0))).toDF("id", "text", "label")
+
+val tokenizer = new Tokenizer().setInputCol("text").setOutputCol("words")
+val hashingTF = new HashingTF().setNumFeatures(1000).setInputCol(tokenizer.getOutputCol).setOutputCol("features")
+val lr = new LogisticRegression().setMaxIter(10).setRegParam(0.01)
+val pipeline = new Pipeline().setStages(Array(tokenizer, hashingTF, lr))
+
+val model = pipeline.fit(training)
+
+var testData = sqlContext.createDataFrame(Seq((4L, "hadoop apache phoenix"), (5L, "hadoop apache hive"),  (6L, "hadoop apache spark"), (7L, "hadoop apache impala"))).toDF("id", "text")
+model.transform(testData).select("id", "text", "probability", "prediction").collect().foreach {case Row(id: Long, text: String, prob: Vector, prediction: Double) => println(s"($id, $text) --> prob=$prob, prediction=$prediction")}
+
+
+=============
+val df = spark.createDataFrame(Seq((0, "a"), (1, "b"), (2, "c"), (3, "a"), (4, "a"), (5, "c"))).toDF("id", "category")
+val indexer = new StringIndexer().setInputCol("category").setOutputCol("categoryIndex")
+
+
+import org.apache.spark.ml.classification.LogisticRegression
+import org.apache.spark.ml.param.ParamMap
+import org.apache.spark.mllib.linalg.{Vector, Vectors}
+import org.apache.spark.sql.Row
+
+val training = sqlContext.createDataFrame(Seq((1.0, Vectors.dense(0.0, 1.1, 0.1)), (0.0, Vectors.dense(2.0, 1.0, -1.0)),(0.0, Vectors.dense(2.0, 1.3, 1.0)), (1.0, Vectors.dense(0.0, 1.2, -0.5)))).toDF("label", "features")
+val lr = new LogisticRegression()
+println("LogisticRegression parameters:\n" + lr.explainParams() + "\n")
+
+lr.setMaxIter(10).setRegParam(0.01)
+
+=============
+import org.apache.spark.ml._
+import org.apache.spark.ml.classification.LogisticRegression
+import org.apache.spark.ml.feature._
+import org.apache.spark.mllib.linalg.Vector
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.functions._
+import org.apache.spark.ml.classification.LogisticRegressionModel
+
+val df_train_raw = spark.read.format("com.databricks.spark.csv").option("header", "true").option("mode", "DROPMALFORMED").load("TS_Data.csv")
+
+//val df_train_raw = spark.read.format("com.databricks.spark.csv").option("header", "true").option("mode", "DROPMALFORMED").load("SimpleLogistic.csv")
+
+val toDouble = udf[Double, String]( _.toDouble)
+
+var df_train = df_train_raw.withColumn("Open", toDouble(df_train_raw("Open"))).withColumn("Close", toDouble(df_train_raw("Close"))).withColumn("High", toDouble(df_train_raw("High"))).withColumn("Low", toDouble(df_train_raw("Low"))).withColumn("target", toDouble(df_train_raw("probability")))
+var df_hold = df_train_raw.withColumn("Open", toDouble(df_train_raw("Open"))).withColumn("Close", toDouble(df_train_raw("Close"))).withColumn("High", toDouble(df_train_raw("High"))).withColumn("Low", toDouble(df_train_raw("Low"))).withColumn("target", toDouble(df_train_raw("probability")))
+
+df_train.columns.drop(1)
+
+//val allFeatureSet = df_train.columns.drop(1)
+var allFeatureSet = df_train.columns.drop(1)
+var assembler = new VectorAssembler().setInputCols(allFeatureSet).setOutputCol("features")
+var featureIndexer = new VectorIndexer().setInputCol("features").setOutputCol("indexedFeatures").setMaxCategories(10)
+var labelIndexer = new StringIndexer().setInputCol("target").setOutputCol("label")
+
+var lr = new LogisticRegression().setLabelCol("label").setFeaturesCol("indexedFeatures").setStandardization(true).setElasticNetParam(0.7).setRegParam(0.0001).setMaxIter(1000).setFitIntercept(true)
+var lr_pipeline = new Pipeline().setStages(Array(assembler, featureIndexer, labelIndexer, lr))
+var lr_model = lr_pipeline.fit(df_train)
+
+var lr_predictions = lr_model.transform(df_hold)
+var model = lr_model.stages(3).asInstanceOf[LogisticRegressionModel]
+println(s"Weights: ${model.weights} Intercept: ${model.intercept}")
+
+val lrpreds = lr_predictions.select("label", "rawPrediction", "probability", "prediction")
+
+var scaleScore = (probability: Vector) => {probability(1)}
+var scaledScoreSQLFunction = udf(scaleScore)
+var lrpreds_prob = lrpreds.withColumn("UpwardProb", scaledScoreSQLFunction(col("probability")))
+
+
+lrpreds.map(x => x.mkString("|")).saveAsTextFile("/user/sxp1542/lrpreds.csv")
+
+================================
+#df.withColumn("Max", max('Close) over windowSpec).show
+
+import org.apache.spark.sql.expressions.Window
+
+var rawData = spark.read.format("com.databricks.spark.csv").option("header", "true").option("mode", "DROPMALFORMED").load("TS_Data.csv")
+rawData.cache
+val toDouble = udf[Double, String]( _.toDouble)
+val toInt = udf[Int, String]( _.toInt)
+val value = udf((high: Double, low: Double, volume:Int) => {(((high + low)/2) * volume).toInt})
+var shortTerm = 5
+var shortTermWindow = Window.orderBy('TimeStamp).rowsBetween(-(shortTerm), -1)
+var lagWindow = Window.orderBy('TimeStamp)
+var dayWindow = Window.partitionBy('Day).orderBy('TimeStamp).rowsBetween(Long.MinValue, 100)
+var leadEODWindow = Window.partitionBy('Day).orderBy('TimeStamp).rowsBetween(1, 100)
+var changeRatio = (value:Double, baseValue:Double) => {"%.0f".format((((value-baseValue)/baseValue)*10000)/25).toInt * 25}
+var changeRatioUDF = udf((value:Double, baseValue:Double) => {changeRatio(value, baseValue)})
+var convertToIST = udf((ts:String) => {((ts.toLong + (630*60))).toString})
+var buySuccess = udf((price:Double, soldPrice:Double) => { if (changeRatio(soldPrice, price) >= 100) 1 else 0 })
+var buyFailure = udf((price:Double, soldPrice:Double) => { if (changeRatio(soldPrice, price) < -50) 1 else 0 })
+
+var data = rawData.withColumn("Open", toDouble(rawData("Open"))).withColumn("Close", toDouble(rawData("Close"))).withColumn("High", toDouble(rawData("High"))).withColumn("Low", toDouble(rawData("Low"))).withColumn("Volume", toInt(rawData("Volume"))).withColumn("TimeStamp", convertToIST(col("TimeStamp")))
+data = data.withColumn("Day", from_unixtime(col("TimeStamp"), "yyyy-MM-dd")).withColumn("DateTime", from_unixtime(col("TimeStamp"), "yyyy-MM-dd HH:mm")).withColumn("Value", value(col("High"), col("Low"), col("Volume")))
+data = data.withColumn("ShortTermVolume", sum(col("Volume")) over shortTermWindow)
+data = data.withColumn("ShortTermAvgVolume", col("ShortTermVolume")/shortTerm)
+data = data.withColumn("VolumeChangeRatio", changeRatioUDF(col("Volume"), col("ShortTermAvgVolume")))
+data = data.withColumn("DayOpen", first(col("Open")) over dayWindow)
+data = data.withColumn("DayClose", last(col("Close")) over leadEODWindow)
+data = data.withColumn("LeadHigh", max(col("Close")) over leadEODWindow)
+data = data.withColumn("LeadLow", min(col("Close")) over leadEODWindow)
+data = data.withColumn("OpenPriceRatio", changeRatioUDF(col("Close"), col("DayOpen")))
+data = data.withColumn("BuySuccess", buySuccess(col("Close"), col("LeadHigh")))
+data = data.withColumn("BuyFailure", buyFailure(col("Close"), col("LeadLow")))
+data = data.withColumn("PotentialProfit", changeRatioUDF(col("LeadHigh"), col("Close")))
+data = data.withColumn("PotentialLoss", changeRatioUDF(col("LeadLow"), col("Close")))
+
+data.createOrReplaceTempView("data")
+
+var dataByDay = spark.sql("select Day, max(TimeStamp) as TimeStamp, max(DayOpen) as Open, max(DayClose) as Close, max(High) as High, min(Low) as Low, sum(Volume) as Volume, sum(Value) as Value, sum(BuySuccess) as SuccessCount, sum(BuyFailure) as FailCount from data group by Day")
+dataByDay.cache
+dataByDay = dataByDay.withColumn("PrevClose", lag(col("Close"), 1) over lagWindow)
+dataByDay = dataByDay.withColumn("OpenCloseRatio", changeRatioUDF(col("Close"), col("Open")))
+dataByDay = dataByDay.withColumn("ShortTermVolumeByDay", sum(col("Volume")) over shortTermWindow)
+dataByDay = dataByDay.withColumn("ShortTermAvgVolumeByDay", col("ShortTermVolumeByDay")/shortTerm)
+dataByDay = dataByDay.withColumn("VolumeChangeRatioByDay", changeRatioUDF(col("Volume"), col("ShortTermAvgVolumeByDay")))
+dataByDay = dataByDay.withColumn("ShortTermPriceChangeByDay", changeRatioUDF(col("Close"), lag(col("Close"), 5) over lagWindow))
+dataByDay = dataByDay.withColumn("MidTermPriceChangeByDay", changeRatioUDF(col("Close"), lag(col("Close"), 10) over lagWindow))
+dataByDay = dataByDay.withColumn("LongTermPriceChangeByDay", changeRatioUDF(col("Close"), lag(col("Close"), 15) over lagWindow))
+
+#data = data.drop(data.col("High")).drop(data.col("Open")).drop(data.col("High")).drop(data.col("Low")).drop(data.col("ShortTermVolume")).drop(data.col("DayOpen")).drop(data.col("DayClose"))
+
+var a = data.groupBy('Day).agg(max('High))
+
+data.write.format("com.databricks.spark.csv").save("data.csv")
+dataByDay.write.format("com.databricks.spark.csv").save("data.csv")
